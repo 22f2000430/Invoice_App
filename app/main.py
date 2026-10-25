@@ -603,6 +603,31 @@ def message_package(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return str(task_id or uuid.uuid4()), package
 
 
+async def send_message(params: dict[str, Any]) -> dict[str, Any]:
+    task_id, package = message_package(params)
+    result = await process_package(task_id, package)
+    return {
+        "id": task_id,
+        "status": {"state": "completed"},
+        "artifacts": [
+            {
+                "name": "invoice-decision",
+                "parts": [{"kind": "data", "data": result}],
+            }
+        ],
+    }
+
+
+@app.post("/message:send", response_model=None)
+async def a2a_message_send(request: dict[str, Any]) -> JSONResponse | dict[str, Any]:
+    if "jsonrpc" in request:
+        return await a2a_rpc(request)
+    params = request.get("params", request)
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="params must be an object")
+    return await send_message(params)
+
+
 @app.post("/")
 async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
     request_id = request.get("id")
@@ -613,9 +638,8 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
             {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "params must be an object"}}
         )
     if method in {"message/send", "tasks/send"}:
-        task_id, package = message_package(params)
         try:
-            result = await process_package(task_id, package)
+            task = await send_message(params)
         except HTTPException as exc:
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": exc.detail}},
@@ -625,16 +649,7 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "id": task_id,
-                    "status": {"state": "completed"},
-                    "artifacts": [
-                        {
-                            "name": "invoice-decision",
-                            "parts": [{"kind": "data", "data": result}],
-                        }
-                    ],
-                },
+                "result": task,
             }
         )
     if method in {"tasks/get", "tasks/getTask"}:

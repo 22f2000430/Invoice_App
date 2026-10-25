@@ -15,6 +15,7 @@ The app listens on Render's `$PORT`. Its A2A base URL is the service root. The d
 
 - `GET /health` — health check.
 - `GET /.well-known/agent-card.json` — A2A Agent Card.
+- `POST /message:send` — A2A message-send endpoint (accepts direct task parameters or JSON-RPC).
 - `POST /` — JSON-RPC A2A `message/send` (also accepts `tasks/send`) and `tasks/get`.
 - `POST /process` — direct JSON API: `{"task_id":"optional-stable-id","package":{...}}`.
 

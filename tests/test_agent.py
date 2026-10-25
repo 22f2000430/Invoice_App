@@ -102,6 +102,32 @@ def test_a2a_send_and_get_task() -> None:
     assert fetched.json()["result"]["status"]["state"] == "completed"
 
 
+def test_a2a_message_send_endpoint_accepts_direct_and_jsonrpc_requests() -> None:
+    package = {
+        "invoice": {"invoice_id": "INV-HTTP", "amount": 25, "currency": "USD"},
+        "text": "Invoice INV-HTTP total USD 25.00",
+    }
+    direct = client.post(
+        "/message:send",
+        json={"taskId": "message-endpoint-direct", "package": package},
+    )
+    assert direct.status_code == 200
+    assert direct.json()["id"] == "message-endpoint-direct"
+    assert direct.json()["status"]["state"] == "completed"
+
+    rpc = client.post(
+        "/message:send",
+        json={
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "message/send",
+            "params": {"taskId": "message-endpoint-rpc", "package": package},
+        },
+    )
+    assert rpc.status_code == 200
+    assert rpc.json()["result"]["id"] == "message-endpoint-rpc"
+
+
 def test_base64_text_attachment_is_read() -> None:
     content = base64.b64encode(b"Invoice INV-4 total USD 10.00").decode()
     response = client.post(
