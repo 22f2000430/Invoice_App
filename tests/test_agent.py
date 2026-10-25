@@ -6,6 +6,14 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import os
+import secrets
+
+from fastapi import HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+security = HTTPBearer(auto_error=False)
+
 os.environ["DATABASE_PATH"] = str(Path(__file__).parent / "test.sqlite3")
 os.environ["A2A_API_TOKEN"] = "local-test-token"
 os.environ.pop("AI_API_KEY", None)
@@ -22,6 +30,33 @@ A2A_HEADERS = {
     "A2A-Version": "0.3.0",
 }
 
+def verify_a2a_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+):
+    expected_token = os.getenv("A2A_API_TOKEN")
+
+    # Fail closed if the production secret is not configured.
+    if not expected_token:
+        raise HTTPException(
+            status_code=500,
+            detail="A2A_API_TOKEN is not configured",
+        )
+
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not secrets.compare_digest(credentials.credentials, expected_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return True
 
 def setup_function() -> None:
     database = Path(os.environ["DATABASE_PATH"])
@@ -53,6 +88,14 @@ def test_a2a_routes_require_bearer_auth_and_protocol_headers() -> None:
         "/message:send",
         json={"taskId": "missing-auth", "package": {}},
         headers={"Content-Type": "application/a2a+json", "A2A-Version": "0.3.0"},
+    ).status_code == 401
+    assert client.get(
+        "/tasks", headers={"Authorization": "Bearer wrong-token"}
+    ).status_code == 401
+    assert client.post(
+        "/message:send",
+        json={"taskId": "wrong-auth", "package": {}},
+        headers={**A2A_HEADERS, "Authorization": "Bearer wrong-token"},
     ).status_code == 401
 
     body = {"taskId": "protocol-check", "package": {}}

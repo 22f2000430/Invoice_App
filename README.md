@@ -1,78 +1,72 @@
 # Public Invoice Agent
 
-An A2A-compatible FastAPI service for reviewing invoice packages, returning evidence-backed decisions, and executing a payment only when an explicit, invoice-specific approval is present. SQLite records task results and payment receipts so retries do not repeat a payment.
+An A2A-compatible FastAPI service for evidence-based invoice decisions, explicitly approved payments, and durable task/receipt handling.
 
 ## Deploy to Render
 
-1. Push this repository to GitHub and create a Render **Blueprint** from it. `render.yaml` provisions the web service and a 1 GB persistent disk mounted at `/var/data`.
-2. Set `A2A_API_TOKEN` to a long, random secret. A2A task listing and sending require `Authorization: Bearer <token>`.
-3. Set `AI_API_KEY` to a GroqCloud API key. The default provider settings are `AI_BASE_URL=https://api.groq.com/openai/v1` and `AI_MODEL=openai/gpt-oss-20b`; change them only if using a different compatible provider.
-4. To execute payments, set `PAYMENT_API_URL` and `PAYMENT_API_KEY` for your payment adapter. It must accept a JSON `POST` with the invoice ID, amount, currency, reason, and citations; return a non-empty JSON receipt on success; and honor the `Idempotency-Key` header. Without a configured adapter, the agent never claims a payment was made.
-5. Set `PUBLIC_BASE_URL` to the deployed HTTPS URL if the A2A Agent Card should advertise an absolute URL.
+1. Push the repository to GitHub and create a Render Blueprint from `render.yaml`. It configures Uvicorn and a persistent disk mounted at `/var/data`.
+2. In the Render service's **Environment** settings, set `A2A_API_TOKEN` to a long, random secret. The A2A client/checker must send this exact value in an `Authorization: Bearer <token>` header. This is separate from `AI_API_KEY`.
+3. Set `AI_API_KEY` to your GroqCloud API key. The default provider settings are `AI_BASE_URL=https://api.groq.com/openai/v1` and `AI_MODEL=openai/gpt-oss-20b`.
+4. To execute payments, configure `PAYMENT_API_URL` and `PAYMENT_API_KEY` for your payment adapter. Without a payment adapter, the agent does not claim to have paid an invoice.
+5. Use the Render service's HTTPS origin as the submitted A2A base URL, for example `https://your-service.onrender.com`—do not append `/message:send`.
 
-The app listens on Render's `$PORT`. Its A2A base URL is the service root. The deployed Agent Card is at `/.well-known/agent-card.json`.
+The Agent Card is at `/.well-known/agent-card.json`. Render starts the app with `uvicorn app.main:app --host 0.0.0.0 --port $PORT`; do not use `--reload` in production.
 
-## Interfaces
+## Routes and protocol
 
 - `GET /health` — health check.
-- `GET /.well-known/agent-card.json` — A2A Agent Card.
-- `GET /tasks` and `GET /tasks/{task_id}` — authenticated task list/status.
-- `POST /message:send` — authenticated A2A message-send endpoint (accepts direct task parameters or JSON-RPC).
-- `POST /tasks/{task_id}:cancel` — authenticated task cancellation.
-- `POST /` — authenticated JSON-RPC A2A `message/send`, `tasks/list`, `tasks/get`, and `tasks/cancel`.
-- `POST /process` — direct JSON API: `{"task_id":"optional-stable-id","package":{...}}`.
+- `GET /.well-known/agent-card.json` — Agent Card; public.
+- `GET /tasks` and `GET /tasks/{task_id}` — require Bearer auth.
+- `POST /message:send` — A2A send; requires Bearer auth, `Content-Type: application/a2a+json`, and `A2A-Version: 0.3.0`.
+- `POST /tasks/{task_id}:cancel` — authenticated cancellation.
+- `POST /` — authenticated JSON-RPC A2A methods.
+- `POST /process` — direct JSON API, not an A2A endpoint.
 
-A2A POST endpoints require `Content-Type: application/a2a+json`, `A2A-Version: 0.3.0`, and a valid Bearer token. Their responses use `Content-Type: application/a2a+json`.
+A2A responses use `Content-Type: application/a2a+json`. Missing or wrong Bearer credentials return HTTP 401. An unsupported A2A version returns HTTP 400; a wrong request media type returns HTTP 415.
 
-An invoice package may contain structured `invoice` data, a trusted `approval` object, document text, and/or A2A file parts encoded as base64. Approval must have this shape:
+## Local development and complete curl checks
 
-```json
-{
-  "approved": true,
-  "invoice_id": "INV-104",
-  "max_amount": 250.00,
-  "currency": "USD"
-}
-```
-
-The approval must match the exact invoice ID and currency, and its amount cap must cover the proposed payment. The AI cannot grant approval. When configured, the analysis provider is called for every new task; when it is not configured, the app uses conservative local extraction and will not auto-pay.
-
-Payment idempotency is keyed by invoice ID, not task ID or amount, so a retry cannot pay that invoice again and a different invoice remains eligible for its own approved payment. An external payment adapter should independently honor the supplied idempotency key to cover network/process failure between its execution and receipt persistence. Configure Render's persistent disk: the default local SQLite path is only for development.
-
-## Local development
-
-Install dependencies and start the server in one terminal:
+Install dependencies and start the app in terminal 1:
 
 ```bash
 python -m pip install -r requirements.txt
-A2A_API_TOKEN=local-test-token uvicorn app.main:app --reload
+export A2A_API_TOKEN=local-test-token
 uvicorn app.main:app --reload
 ```
 
-In a second terminal, run these checks from the project directory. They do not need an AI or payment provider configured; the sample invoice should be held rather than paid.
+In terminal 2, from the project directory:
 
 ```bash
-# 1. Service health and browser landing page.
-curl -i http://localhost:8000/health
-curl -i http://localhost:8000/
+export BASE_URL=http://localhost:8000
+export A2A_API_TOKEN=local-test-token
 
-# 2. Agent Card.
-curl -i http://localhost:8000/.well-known/agent-card.json
+# Health and public discovery.
+curl -i "$BASE_URL/health"
+curl -i "$BASE_URL/"
+curl -i "$BASE_URL/.well-known/agent-card.json"
 
-# 3. Direct invoice-processing API.
-curl -i -X POST http://localhost:8000/process \
+# Authentication checks: both should return HTTP 401.
+curl -sS -o /dev/null -w 'no token: HTTP %{http_code}\n' "$BASE_URL/tasks"
+curl -sS -o /dev/null -w 'wrong token: HTTP %{http_code}\n' \
+  -H 'Authorization: Bearer wrong-token' "$BASE_URL/tasks"
+
+# Protocol rejection checks: wrong media type -> HTTP 415; wrong version -> HTTP 400.
+curl -sS -o /dev/null -w 'wrong media type: HTTP %{http_code}\n' \
+  -X POST "$BASE_URL/message:send" \
+  -H "Authorization: Bearer $A2A_API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "task_id": "local-direct-001",
-    "package": {
-      "invoice": {"invoice_id": "INV-104", "amount": 125, "currency": "USD"},
-      "text": "Invoice INV-104 total USD 125.00"
-    }
-  }'
+  -H 'A2A-Version: 0.3.0' \
+  -d '{}'
+curl -sS -o /dev/null -w 'wrong version: HTTP %{http_code}\n' \
+  -X POST "$BASE_URL/message:send" \
+  -H "Authorization: Bearer $A2A_API_TOKEN" \
+  -H 'Content-Type: application/a2a+json' \
+  -H 'A2A-Version: 99.0' \
+  -d '{}'
 
-# 4. A2A checker endpoint. Confirm response Content-Type is application/a2a+json.
-curl -i -X POST http://localhost:8000/message:send \
-  -H 'Authorization: Bearer local-test-token' \
+# A2A send: expect HTTP 200 and Content-Type: application/a2a+json.
+curl -i -X POST "$BASE_URL/message:send" \
+  -H "Authorization: Bearer $A2A_API_TOKEN" \
   -H 'Content-Type: application/a2a+json' \
   -H 'A2A-Version: 0.3.0' \
   -H 'Accept: application/a2a+json' \
@@ -84,45 +78,38 @@ curl -i -X POST http://localhost:8000/message:send \
     }
   }'
 
-# 5. JSON-RPC A2A alternative.
-curl -i -X POST http://localhost:8000/ \
-  -H 'Authorization: Bearer local-test-token' \
-  -H 'Content-Type: application/a2a+json' \
-  -H 'A2A-Version: 0.3.0' \
-  -H 'Accept: application/a2a+json' \
+# List tasks (expect HTTP 200).
+curl -i "$BASE_URL/tasks" \
+  -H "Authorization: Bearer $A2A_API_TOKEN"
+
+# Get the task just submitted (expect HTTP 200).
+curl -i "$BASE_URL/tasks/local-a2a-001" \
+  -H "Authorization: Bearer $A2A_API_TOKEN"
+
+# Direct invoice-processing endpoint, independent of A2A auth.
+curl -i -X POST "$BASE_URL/process" \
+  -H 'Content-Type: application/json' \
   -d '{
-    "jsonrpc": "2.0",
-    "id": "request-1",
-    "method": "message/send",
-    "params": {
-      "taskId": "local-rpc-001",
-      "package": {
-        "invoice": {"invoice_id": "INV-106", "amount": 45, "currency": "USD"},
-        "text": "Invoice INV-106 total USD 45.00"
-      }
+    "task_id": "local-direct-001",
+    "package": {
+      "invoice": {"invoice_id": "INV-104", "amount": 125, "currency": "USD"},
+      "text": "Invoice INV-104 total USD 125.00"
     }
   }'
 
-# 6. Retrieve a completed task using JSON-RPC.
-curl -i -X POST http://localhost:8000/ \
-  -H 'Authorization: Bearer local-test-token' \
+# A2A cancellation (expect HTTP 200 or a conflict if task already completed).
+curl -i -X POST "$BASE_URL/tasks/local-a2a-001:cancel" \
+  -H "Authorization: Bearer $A2A_API_TOKEN" \
   -H 'Content-Type: application/a2a+json' \
-  -H 'A2A-Version: 0.3.0' \
-  -H 'Accept: application/a2a+json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": "request-2",
-    "method": "tasks/get",
-    "params": {"id": "local-rpc-001"}
-  }'
-
-# 7. List recent tasks (requires the same Bearer token).
-curl -i http://localhost:8000/tasks \
-  -H 'Authorization: Bearer local-test-token'
-
-# 8. Read an individual task (use a task ID created above).
-curl -i http://localhost:8000/tasks/local-rpc-001 \
-  -H 'Authorization: Bearer local-test-token'
+  -H 'A2A-Version: 0.3.0'
 ```
 
-These commands assume the app is running locally on Uvicorn's default port, `8000`, with the local token shown above. For the A2A checks, `curl -i` displays the response headers; both A2A POST examples should return HTTP 200 and `Content-Type: application/a2a+json`. Do not use `--reload` in Render's start command.
+## Test Render
+
+Set `BASE_URL` to the Render HTTPS origin (no path suffix). Set `A2A_API_TOKEN` in the terminal to the exact secret saved in Render, then run the authenticated A2A curl checks above.
+
+If curl with the Render token returns 200 but the checker returns 401, the checker did not send that same Bearer token. Configure its authentication/token field with the Render `A2A_API_TOKEN` if it provides one. The Agent Card advertises HTTP Bearer authentication, but it does not reveal the secret. Do not disable auth: unauthenticated task listing and sending are expected to return 401.
+
+## Invoice safety behavior
+
+An approval must explicitly match the invoice ID and currency, and its amount cap must cover the payment amount. The AI cannot grant approval. A2A task state and receipt records are stored in SQLite on Render's persistent disk. Payment idempotency is invoice-scoped; the payment adapter should also honor the supplied idempotency key to protect against network failures during payment processing.
