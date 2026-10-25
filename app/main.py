@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 APP_NAME = "Public Invoice Agent"
+A2A_MEDIA_TYPE = "application/a2a+json"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/invoice-agent.sqlite3")
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -624,8 +625,20 @@ async def a2a_message_send(request: dict[str, Any]) -> JSONResponse | dict[str, 
         return await a2a_rpc(request)
     params = request.get("params", request)
     if not isinstance(params, dict):
-        raise HTTPException(status_code=400, detail="params must be an object")
-    return await send_message(params)
+        return JSONResponse(
+            {"error": "params must be an object"},
+            status_code=400,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    try:
+        task = await send_message(params)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    return JSONResponse(task, media_type=A2A_MEDIA_TYPE)
 
 
 @app.post("/")
@@ -635,7 +648,8 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
     params = request.get("params") or {}
     if not isinstance(params, dict):
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "params must be an object"}}
+            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "params must be an object"}},
+            media_type=A2A_MEDIA_TYPE,
         )
     if method in {"message/send", "tasks/send"}:
         try:
@@ -644,13 +658,15 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": exc.detail}},
                 status_code=exc.status_code,
+                media_type=A2A_MEDIA_TYPE,
             )
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": task,
-            }
+            },
+            media_type=A2A_MEDIA_TYPE,
         )
     if method in {"tasks/get", "tasks/getTask"}:
         task_id = params.get("id") or params.get("taskId")
@@ -662,6 +678,7 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "Task not found"}},
                 status_code=404,
+                media_type=A2A_MEDIA_TYPE,
             )
         task_result = json.loads(row["result_json"]) if row["result_json"] else None
         return JSONResponse(
@@ -682,9 +699,11 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
                         else []
                     ),
                 },
-            }
+            },
+            media_type=A2A_MEDIA_TYPE,
         )
     return JSONResponse(
         {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}},
         status_code=404,
+        media_type=A2A_MEDIA_TYPE,
     )

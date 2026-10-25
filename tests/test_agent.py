@@ -112,6 +112,7 @@ def test_a2a_message_send_endpoint_accepts_direct_and_jsonrpc_requests() -> None
         json={"taskId": "message-endpoint-direct", "package": package},
     )
     assert direct.status_code == 200
+    assert direct.headers["content-type"] == "application/a2a+json"
     assert direct.json()["id"] == "message-endpoint-direct"
     assert direct.json()["status"]["state"] == "completed"
 
@@ -125,6 +126,7 @@ def test_a2a_message_send_endpoint_accepts_direct_and_jsonrpc_requests() -> None
         },
     )
     assert rpc.status_code == 200
+    assert rpc.headers["content-type"] == "application/a2a+json"
     assert rpc.json()["result"]["id"] == "message-endpoint-rpc"
 
 
