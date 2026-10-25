@@ -12,12 +12,14 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /var/data/invoice-agent.sqlite3
+      - key: A2A_API_TOKEN
+        sync: false
       - key: AI_API_KEY
         sync: false
       - key: AI_BASE_URL
-        value: https://api.openai.com/v1
+        value: https://api.groq.com/openai/v1
       - key: AI_MODEL
-        value: gpt-4o-mini
+        value: openai/gpt-oss-20b
       - key: PAYMENT_API_URL
         sync: false
       - key: PAYMENT_API_KEY

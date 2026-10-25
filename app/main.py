@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
@@ -13,17 +14,19 @@ from typing import Any, AsyncIterator, Iterator
 
 import httpx
 from docx import Document
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 APP_NAME = "Public Invoice Agent"
 A2A_MEDIA_TYPE = "application/a2a+json"
+A2A_PROTOCOL_VERSION = "0.3.0"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/invoice-agent.sqlite3")
+A2A_API_TOKEN = os.getenv("A2A_API_TOKEN", "")
 AI_API_KEY = os.getenv("AI_API_KEY")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-20b")
 PAYMENT_API_URL = os.getenv("PAYMENT_API_URL")
 PAYMENT_API_KEY = os.getenv("PAYMENT_API_KEY")
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
@@ -74,11 +77,24 @@ def initialize_database() -> None:
                 action TEXT NOT NULL,
                 status TEXT NOT NULL,
                 receipt_json TEXT,
+                request_hash TEXT,
+                task_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             """
         )
+        existing_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(invoice_actions)")
+        }
+        for column, definition in (
+            ("request_hash", "TEXT"),
+            ("task_id", "TEXT"),
+        ):
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE invoice_actions ADD COLUMN {column} {definition}"
+                )
 
 
 def utc_now() -> str:
@@ -360,7 +376,12 @@ def prior_action(invoice_id: str) -> sqlite3.Row | None:
 
 
 async def execute_payment(
-    invoice_id: str, amount: float, currency: str, reason: str, citations: list[str]
+    invoice_id: str,
+    amount: float,
+    currency: str,
+    reason: str,
+    citations: list[str],
+    task_id: str,
 ) -> dict[str, Any]:
     if not PAYMENT_API_URL:
         return {"status": "not_executed", "detail": "Payment connector is not configured."}
@@ -368,15 +389,35 @@ async def execute_payment(
         raise HTTPException(status_code=503, detail="PAYMENT_API_KEY is required for payment execution")
 
     now = utc_now()
+    payment_hash = hashlib.sha256(
+        json.dumps(
+            {"invoice_id": invoice_id, "amount": amount, "currency": currency.upper()},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     with database() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        task = connection.execute(
+            "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not task or task["status"] != "working":
+            connection.execute("COMMIT")
+            return {
+                "status": "not_executed",
+                "detail": "Task is no longer active; payment was not attempted.",
+            }
         existing = connection.execute(
-            "SELECT status, receipt_json FROM invoice_actions WHERE invoice_id = ?",
+            "SELECT status, receipt_json, request_hash FROM invoice_actions WHERE invoice_id = ?",
             (invoice_id,),
         ).fetchone()
         if existing:
             receipt = json.loads(existing["receipt_json"]) if existing["receipt_json"] else None
             connection.execute("COMMIT")
+            if existing["request_hash"] and existing["request_hash"] != payment_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Invoice already has an action with conflicting payment details",
+                )
             if existing["status"] == "succeeded":
                 return {
                     "status": "already_processed",
@@ -390,10 +431,12 @@ async def execute_payment(
             }
         connection.execute(
             """
-            INSERT INTO invoice_actions(invoice_id, action, status, created_at, updated_at)
-            VALUES (?, 'pay', 'pending', ?, ?)
+            INSERT INTO invoice_actions(
+                invoice_id, action, status, request_hash, task_id, created_at, updated_at
+            )
+            VALUES (?, 'pay', 'pending', ?, ?, ?, ?)
             """,
-            (invoice_id, now, now),
+            (invoice_id, payment_hash, task_id, now, now),
         )
         connection.execute("COMMIT")
 
@@ -406,7 +449,7 @@ async def execute_payment(
     }
     headers = {
         "Authorization": f"Bearer {PAYMENT_API_KEY}",
-        "Idempotency-Key": hashlib.sha256(invoice_id.encode("utf-8")).hexdigest(),
+        "Idempotency-Key": payment_hash,
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -427,17 +470,32 @@ async def execute_payment(
                 (utc_now(), invoice_id),
             )
         raise HTTPException(status_code=502, detail="Payment connector returned no receipt")
+    receipt = {
+        "invoice_id": invoice_id,
+        "amount": amount,
+        "currency": currency.upper(),
+        "task_id": task_id,
+        "provider_receipt": receipt_body,
+    }
     with database() as connection:
         connection.execute(
             "UPDATE invoice_actions SET status = 'succeeded', receipt_json = ?, updated_at = ? WHERE invoice_id = ?",
-            (json.dumps(receipt_body), utc_now(), invoice_id),
+            (json.dumps(receipt), utc_now(), invoice_id),
         )
-    return {"status": "executed", "receipt": receipt_body}
+    return {"status": "executed", "receipt": receipt}
 
 
 def request_hash(package: dict[str, Any]) -> str:
     serialized = json.dumps(package, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def mark_task_failed(task_id: str) -> None:
+    with database() as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'failed', updated_at = ? WHERE task_id = ? AND status = 'working'",
+            (utc_now(), task_id),
+        )
 
 
 async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, Any]:
@@ -456,15 +514,28 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
             result = json.loads(saved["result_json"])
             connection.execute("COMMIT")
             return result
+        if saved and saved["status"] in {"canceled", "failed"}:
+            connection.execute("COMMIT")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task cannot be continued from state {saved['status']}",
+            )
+        if saved and saved["status"] == "working":
+            connection.execute("COMMIT")
+            raise HTTPException(status_code=409, detail="Task is already being processed")
         if not saved:
             connection.execute(
-                "INSERT INTO tasks(task_id, request_hash, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
+                "INSERT INTO tasks(task_id, request_hash, status, created_at, updated_at) VALUES (?, ?, 'working', ?, ?)",
                 (task_id, digest, now, now),
             )
         connection.execute("COMMIT")
 
-    evidence_text = package_text(package)
-    analysis = await analyze_invoice(package, evidence_text)
+    try:
+        evidence_text = package_text(package)
+        analysis = await analyze_invoice(package, evidence_text)
+    except HTTPException:
+        mark_task_failed(task_id)
+        raise
     invoice_id = normalize_invoice_id(analysis.get("invoice_id")) or payload_invoice_id(package)
     action = analysis.get("action")
     if action not in {"pay", "hold", "reject", "request_information"}:
@@ -490,9 +561,13 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
             action = "hold"
             reason = "Payment was not executed: citations do not verify the invoice ID, amount, and currency."
         else:
-            payment = await execute_payment(
-                invoice_id, amount_value, currency, reason, citations
-            )
+            try:
+                payment = await execute_payment(
+                    invoice_id, amount_value, currency, reason, citations, task_id
+                )
+            except HTTPException:
+                mark_task_failed(task_id)
+                raise
             if payment.get("status") not in {"executed", "already_processed"}:
                 action = "hold"
                 reason = str(payment.get("detail", "Payment was not executed."))
@@ -508,10 +583,84 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
     }
     with database() as connection:
         connection.execute(
-            "UPDATE tasks SET status = 'completed', result_json = ?, updated_at = ? WHERE task_id = ?",
+            "UPDATE tasks SET status = 'completed', result_json = ?, updated_at = ? WHERE task_id = ? AND status = 'working'",
             (json.dumps(result, ensure_ascii=False), utc_now(), task_id),
         )
     return result
+
+
+def require_a2a_auth(authorization: str | None) -> None:
+    scheme, separator, supplied_token = (authorization or "").partition(" ")
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not supplied_token.strip()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not A2A_API_TOKEN:
+        raise HTTPException(status_code=503, detail="A2A_API_TOKEN is not configured")
+    if not secrets.compare_digest(supplied_token.strip(), A2A_API_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def validate_a2a_headers(content_type: str | None, version: str | None) -> None:
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if media_type != A2A_MEDIA_TYPE:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Content-Type must be {A2A_MEDIA_TYPE}",
+        )
+    if version != A2A_PROTOCOL_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported or missing A2A-Version; expected {A2A_PROTOCOL_VERSION}",
+        )
+
+
+def cancel_task(task_id: str) -> dict[str, Any]:
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        task = connection.execute(
+            "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            connection.execute("ROLLBACK")
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task["status"] != "working":
+            connection.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task cannot be canceled from state {task['status']}",
+            )
+        payment = connection.execute(
+            "SELECT status FROM invoice_actions WHERE task_id = ? AND action = 'pay'",
+            (task_id,),
+        ).fetchone()
+        if payment and payment["status"] in {"pending", "succeeded"}:
+            connection.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=409,
+                detail="Task cannot be canceled while a payment is pending or has completed",
+            )
+        now = utc_now()
+        connection.execute(
+            "UPDATE tasks SET status = 'canceled', updated_at = ? WHERE task_id = ? AND status = 'working'",
+            (now, task_id),
+        )
+        connection.execute("COMMIT")
+    return {
+        "id": task_id,
+        "status": {"state": "canceled"},
+        "updatedAt": now,
+    }
 
 
 @app.get("/health")
@@ -547,19 +696,25 @@ def agent_card() -> dict[str, Any]:
     return {
         "name": APP_NAME,
         "description": "Analyzes invoice packages, cites evidence, enforces explicit approval, and records idempotent payment receipts.",
-        "url": base_url or "/",
+        "url": base_url,
+        "protocolVersion": A2A_PROTOCOL_VERSION,
         "version": "1.0.0",
+        "preferredTransport": "JSONRPC",
         "capabilities": {"streaming": False, "pushNotifications": False},
-        "defaultInputModes": ["application/json", "text/plain"],
-        "defaultOutputModes": ["application/json"],
+        "securitySchemes": {
+            "bearerAuth": {"type": "http", "scheme": "bearer"}
+        },
+        "security": [{"bearerAuth": []}],
+        "defaultInputModes": [A2A_MEDIA_TYPE, "application/json", "text/plain"],
+        "defaultOutputModes": [A2A_MEDIA_TYPE, "application/json"],
         "skills": [
             {
                 "id": "invoice-decision",
                 "name": "Invoice decision",
                 "description": "Assess invoices and execute only explicitly approved payments.",
                 "tags": ["invoice", "payment", "approval", "evidence"],
-                "inputModes": ["application/json", "text/plain"],
-                "outputModes": ["application/json"],
+                "inputModes": [A2A_MEDIA_TYPE, "application/json", "text/plain"],
+                "outputModes": [A2A_MEDIA_TYPE, "application/json"],
             }
         ],
     }
@@ -598,13 +753,41 @@ def message_package(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                     break
     if not isinstance(package, dict):
         package = {"text": "\n".join(text_parts)}
-    task_id = params.get("taskId") or params.get("task_id")
+    task_id = (
+        params.get("taskId")
+        or params.get("task_id")
+        or (message.get("taskId") if isinstance(message, dict) else None)
+    )
     if not task_id and isinstance(message, dict):
         task_id = message.get("messageId")
     return str(task_id or uuid.uuid4()), package
 
 
+def validate_task_references(params: dict[str, Any]) -> None:
+    message = params.get("message")
+    references = params.get("referenceTaskIds")
+    if references is None and isinstance(message, dict):
+        references = message.get("referenceTaskIds")
+    if references is None:
+        return
+    if not isinstance(references, list) or not references:
+        raise HTTPException(status_code=400, detail="referenceTaskIds must be a non-empty array")
+    with database() as connection:
+        for reference in references:
+            if not isinstance(reference, str) or not reference:
+                raise HTTPException(status_code=400, detail="Invalid task reference")
+            row = connection.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (reference,)
+            ).fetchone()
+            if not row or row["status"] not in {"working", "input-required"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Task reference {reference} does not identify a continuable task",
+                )
+
+
 async def send_message(params: dict[str, Any]) -> dict[str, Any]:
+    validate_task_references(params)
     task_id, package = message_package(params)
     result = await process_package(task_id, package)
     return {
@@ -619,10 +802,128 @@ async def send_message(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@app.get("/tasks")
+def list_tasks(
+    limit: int = Query(default=10, ge=1, le=10),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    try:
+        require_a2a_auth(authorization)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    with database() as connection:
+        rows = connection.execute(
+            """
+            SELECT task_id, status, created_at, updated_at
+            FROM tasks ORDER BY created_at DESC, task_id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return JSONResponse(
+        {
+            "tasks": [
+                {
+                    "id": row["task_id"],
+                    "status": {"state": row["status"]},
+                    "createdAt": row["created_at"],
+                    "updatedAt": row["updated_at"],
+                }
+                for row in rows
+            ],
+            "pageSize": limit,
+        },
+        media_type=A2A_MEDIA_TYPE,
+    )
+
+
+@app.get("/tasks/{task_id}")
+def get_task(
+    task_id: str,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    try:
+        require_a2a_auth(authorization)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    with database() as connection:
+        row = connection.execute(
+            "SELECT task_id, status, result_json, created_at, updated_at FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    if not row:
+        return JSONResponse(
+            {"error": "Task not found"},
+            status_code=404,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    result = json.loads(row["result_json"]) if row["result_json"] else None
+    return JSONResponse(
+        {
+            "id": row["task_id"],
+            "status": {"state": row["status"]},
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "result": result,
+        },
+        media_type=A2A_MEDIA_TYPE,
+    )
+
+
+@app.post("/tasks/{task_id}:cancel", response_model=None)
+def cancel_task_endpoint(
+    task_id: str,
+    authorization: str | None = Header(default=None),
+    content_type: str | None = Header(default=None),
+    a2a_version: str | None = Header(default=None, alias="A2A-Version"),
+) -> JSONResponse:
+    try:
+        require_a2a_auth(authorization)
+        validate_a2a_headers(content_type, a2a_version)
+        task = cancel_task(task_id)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+            media_type=A2A_MEDIA_TYPE,
+        )
+    return JSONResponse(task, media_type=A2A_MEDIA_TYPE)
+
+
 @app.post("/message:send", response_model=None)
-async def a2a_message_send(request: dict[str, Any]) -> JSONResponse | dict[str, Any]:
+async def a2a_message_send(
+    request: dict[str, Any],
+    authorization: str | None = Header(default=None),
+    content_type: str | None = Header(default=None),
+    a2a_version: str | None = Header(default=None, alias="A2A-Version"),
+) -> JSONResponse:
+    try:
+        require_a2a_auth(authorization)
+        validate_a2a_headers(content_type, a2a_version)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"error": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+            media_type=A2A_MEDIA_TYPE,
+        )
     if "jsonrpc" in request:
-        return await a2a_rpc(request)
+        return await a2a_rpc(
+            request,
+            authorization=authorization,
+            content_type=content_type,
+            a2a_version=a2a_version,
+        )
     params = request.get("params", request)
     if not isinstance(params, dict):
         return JSONResponse(
@@ -642,7 +943,26 @@ async def a2a_message_send(request: dict[str, Any]) -> JSONResponse | dict[str, 
 
 
 @app.post("/")
-async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
+async def a2a_rpc(
+    request: dict[str, Any],
+    authorization: str | None = Header(default=None),
+    content_type: str | None = Header(default=None),
+    a2a_version: str | None = Header(default=None, alias="A2A-Version"),
+) -> JSONResponse:
+    try:
+        require_a2a_auth(authorization)
+        validate_a2a_headers(content_type, a2a_version)
+    except HTTPException as exc:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": -32001, "message": exc.detail},
+            },
+            status_code=exc.status_code,
+            headers=exc.headers,
+            media_type=A2A_MEDIA_TYPE,
+        )
     request_id = request.get("id")
     method = request.get("method")
     params = request.get("params") or {}
@@ -661,10 +981,29 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
                 media_type=A2A_MEDIA_TYPE,
             )
         return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "result": task},
+            media_type=A2A_MEDIA_TYPE,
+        )
+    if method == "tasks/list":
+        with database() as connection:
+            rows = connection.execute(
+                "SELECT task_id, status, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT 10"
+            ).fetchall()
+        return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": task,
+                "result": {
+                    "tasks": [
+                        {
+                            "id": row["task_id"],
+                            "status": {"state": row["status"]},
+                            "createdAt": row["created_at"],
+                            "updatedAt": row["updated_at"],
+                        }
+                        for row in rows
+                    ]
+                },
             },
             media_type=A2A_MEDIA_TYPE,
         )
@@ -687,7 +1026,7 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
                 "id": request_id,
                 "result": {
                     "id": task_id,
-                    "status": {"state": "completed" if row["status"] == "completed" else "working"},
+                    "status": {"state": row["status"]},
                     "artifacts": (
                         [
                             {
@@ -700,6 +1039,24 @@ async def a2a_rpc(request: dict[str, Any]) -> JSONResponse:
                     ),
                 },
             },
+            media_type=A2A_MEDIA_TYPE,
+        )
+    if method in {"tasks/cancel", "tasks/cancelTask"}:
+        task_id = params.get("id") or params.get("taskId")
+        try:
+            task = cancel_task(str(task_id or ""))
+        except HTTPException as exc:
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": exc.detail},
+                },
+                status_code=exc.status_code,
+                media_type=A2A_MEDIA_TYPE,
+            )
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "result": task},
             media_type=A2A_MEDIA_TYPE,
         )
     return JSONResponse(
