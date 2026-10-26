@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
@@ -23,7 +22,6 @@ APP_NAME = "Public Invoice Agent"
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_PROTOCOL_VERSION = "0.3.0"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/invoice-agent.sqlite3")
-A2A_API_TOKEN = os.getenv("A2A_API_TOKEN", "")
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-20b")
@@ -589,28 +587,6 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
     return result
 
 
-def require_a2a_auth(authorization: str | None) -> None:
-    scheme, separator, supplied_token = (authorization or "").partition(" ")
-    if (
-        not separator
-        or scheme.lower() != "bearer"
-        or not supplied_token.strip()
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Bearer token required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not A2A_API_TOKEN:
-        raise HTTPException(status_code=503, detail="A2A_API_TOKEN is not configured")
-    if not secrets.compare_digest(supplied_token.strip(), A2A_API_TOKEN):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
 def validate_a2a_headers(content_type: str | None, version: str | None) -> None:
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
     if media_type != A2A_MEDIA_TYPE:
@@ -701,10 +677,6 @@ def agent_card() -> dict[str, Any]:
         "version": "1.0.0",
         "preferredTransport": "JSONRPC",
         "capabilities": {"streaming": False, "pushNotifications": False},
-        "securitySchemes": {
-            "bearerAuth": {"type": "http", "scheme": "bearer"}
-        },
-        "security": [{"bearerAuth": []}],
         "defaultInputModes": [A2A_MEDIA_TYPE, "application/json", "text/plain"],
         "defaultOutputModes": [A2A_MEDIA_TYPE, "application/json"],
         "skills": [
@@ -805,17 +777,7 @@ async def send_message(params: dict[str, Any]) -> dict[str, Any]:
 @app.get("/tasks")
 def list_tasks(
     limit: int = Query(default=10, ge=1, le=10),
-    authorization: str | None = Header(default=None),
 ) -> JSONResponse:
-    try:
-        require_a2a_auth(authorization)
-    except HTTPException as exc:
-        return JSONResponse(
-            {"error": exc.detail},
-            status_code=exc.status_code,
-            headers=exc.headers,
-            media_type=A2A_MEDIA_TYPE,
-        )
     with database() as connection:
         rows = connection.execute(
             """
@@ -844,17 +806,7 @@ def list_tasks(
 @app.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
-    authorization: str | None = Header(default=None),
 ) -> JSONResponse:
-    try:
-        require_a2a_auth(authorization)
-    except HTTPException as exc:
-        return JSONResponse(
-            {"error": exc.detail},
-            status_code=exc.status_code,
-            headers=exc.headers,
-            media_type=A2A_MEDIA_TYPE,
-        )
     with database() as connection:
         row = connection.execute(
             "SELECT task_id, status, result_json, created_at, updated_at FROM tasks WHERE task_id = ?",
@@ -887,7 +839,6 @@ def cancel_task_endpoint(
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
 ) -> JSONResponse:
     try:
-        require_a2a_auth(authorization)
         validate_a2a_headers(content_type, a2a_version)
         task = cancel_task(task_id)
     except HTTPException as exc:
@@ -908,7 +859,6 @@ async def a2a_message_send(
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
 ) -> JSONResponse:
     try:
-        require_a2a_auth(authorization)
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
         return JSONResponse(
@@ -920,7 +870,6 @@ async def a2a_message_send(
     if "jsonrpc" in request:
         return await a2a_rpc(
             request,
-            authorization=authorization,
             content_type=content_type,
             a2a_version=a2a_version,
         )
@@ -950,7 +899,6 @@ async def a2a_rpc(
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
 ) -> JSONResponse:
     try:
-        require_a2a_auth(authorization)
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
         return JSONResponse(

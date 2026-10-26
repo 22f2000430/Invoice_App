@@ -7,15 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import os
-import secrets
-
-from fastapi import HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-security = HTTPBearer(auto_error=False)
-
 os.environ["DATABASE_PATH"] = str(Path(__file__).parent / "test.sqlite3")
-os.environ["A2A_API_TOKEN"] = "local-test-token"
 os.environ.pop("AI_API_KEY", None)
 os.environ.pop("PAYMENT_API_URL", None)
 os.environ.pop("PAYMENT_API_KEY", None)
@@ -25,38 +17,9 @@ import app.main as agent
 
 client = TestClient(app)
 A2A_HEADERS = {
-    "Authorization": "Bearer local-test-token",
     "Content-Type": "application/a2a+json",
     "A2A-Version": "0.3.0",
 }
-
-def verify_a2a_token(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-):
-    expected_token = os.getenv("A2A_API_TOKEN")
-
-    # Fail closed if the production secret is not configured.
-    if not expected_token:
-        raise HTTPException(
-            status_code=500,
-            detail="A2A_API_TOKEN is not configured",
-        )
-
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=401,
-            detail="Missing Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not secrets.compare_digest(credentials.credentials, expected_token):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return True
 
 def setup_function() -> None:
     database = Path(os.environ["DATABASE_PATH"])
@@ -79,24 +42,17 @@ def test_agent_card_and_health() -> None:
     assert card["skills"][0]["id"] == "invoice-decision"
     assert card["protocolVersion"] == "0.3.0"
     assert "application/a2a+json" in card["defaultInputModes"]
-    assert card["security"][0]["bearerAuth"] == []
+    assert "security" not in card
+    assert "securitySchemes" not in card
 
 
-def test_a2a_routes_require_bearer_auth_and_protocol_headers() -> None:
-    assert client.get("/tasks").status_code == 401
+def test_a2a_routes_are_public_and_validate_protocol_headers() -> None:
+    assert client.get("/tasks").status_code == 200
     assert client.post(
         "/message:send",
-        json={"taskId": "missing-auth", "package": {}},
+        json={"taskId": "public-no-auth", "package": {}},
         headers={"Content-Type": "application/a2a+json", "A2A-Version": "0.3.0"},
-    ).status_code == 401
-    assert client.get(
-        "/tasks", headers={"Authorization": "Bearer wrong-token"}
-    ).status_code == 401
-    assert client.post(
-        "/message:send",
-        json={"taskId": "wrong-auth", "package": {}},
-        headers={**A2A_HEADERS, "Authorization": "Bearer wrong-token"},
-    ).status_code == 401
+    ).status_code == 200
 
     body = {"taskId": "protocol-check", "package": {}}
     wrong_version = client.post(
@@ -114,14 +70,9 @@ def test_a2a_routes_require_bearer_auth_and_protocol_headers() -> None:
     assert wrong_version.headers["content-type"] == "application/a2a+json"
     assert wrong_media.headers["content-type"] == "application/a2a+json"
 
-    assert client.get("/tasks", headers={"Authorization": "Bearer local-test-token"}).status_code == 200
-    assert client.get(
-        "/tasks?limit=11", headers={"Authorization": "Bearer local-test-token"}
-    ).status_code == 422
-    assert client.get("/tasks/a2a-1").status_code == 401
-    assert client.get(
-        "/tasks/a2a-1", headers={"Authorization": "Bearer local-test-token"}
-    ).status_code == 404
+    assert client.get("/tasks").status_code == 200
+    assert client.get("/tasks?limit=11").status_code == 422
+    assert client.get("/tasks/a2a-1").status_code == 404
 
 
 def test_invalid_continuation_is_rejected_and_tasks_can_be_canceled() -> None:
@@ -204,10 +155,7 @@ def test_task_cannot_be_canceled_during_payment() -> None:
         headers=A2A_HEADERS,
     )
     assert response.status_code == 409
-    assert client.get(
-        "/tasks/payment-in-flight",
-        headers={"Authorization": "Bearer local-test-token"},
-    ).json()["status"]["state"] == "working"
+    assert client.get("/tasks/payment-in-flight").json()["status"]["state"] == "working"
 
 
 def test_task_retry_returns_saved_decision_and_rejects_changed_package() -> None:
