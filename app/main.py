@@ -21,6 +21,7 @@ from pypdf import PdfReader
 APP_NAME = "Public Invoice Agent"
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_PROTOCOL_VERSION = "0.3.0"
+A2A_PROTOCOL_VERSION_ALIASES = {A2A_PROTOCOL_VERSION, "v3"}
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/invoice-agent.sqlite3")
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
@@ -594,10 +595,10 @@ def validate_a2a_headers(content_type: str | None, version: str | None) -> None:
             status_code=415,
             detail=f"Content-Type must be {A2A_MEDIA_TYPE}",
         )
-    if version is not None and version != A2A_PROTOCOL_VERSION:
+    if version is not None and version not in A2A_PROTOCOL_VERSION_ALIASES:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported A2A-Version; expected {A2A_PROTOCOL_VERSION}",
+            detail=f"Unsupported A2A-Version; expected one of {', '.join(sorted(A2A_PROTOCOL_VERSION_ALIASES))}",
         )
 
 

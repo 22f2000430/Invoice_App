@@ -58,6 +58,17 @@ def test_a2a_routes_are_public_and_validate_protocol_headers() -> None:
         json={"taskId": "public-no-version", "package": {}},
         headers={"Content-Type": "application/a2a+json"},
     ).status_code == 200
+    version_v3 = client.post(
+        "/message:send",
+        json={"taskId": "public-version-v3", "package": {}},
+        headers={
+            "Content-Type": "application/a2a+json",
+            "A2A-Version": "v3",
+            "Authorization": "Bearer validator-token",
+        },
+    )
+    assert version_v3.status_code == 200
+    assert version_v3.json()["id"] == "public-version-v3"
 
     body = {"taskId": "protocol-check", "package": {}}
     wrong_version = client.post(
