@@ -347,6 +347,13 @@ async def analyze_invoice(package: dict[str, Any], text: str) -> dict[str, Any]:
             if not isinstance(content, str):
                 raise ValueError("The AI provider returned no JSON content")
             parsed = json.loads(content)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 413:
+            logger.warning(
+                "AI provider rejected invoice analysis as too large; using conservative local analysis"
+            )
+            return fallback_analysis(package, text)
+        raise HTTPException(status_code=502, detail=f"Invoice analysis failed: {exc}") from exc
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=f"Invoice analysis failed: {exc}") from exc
     if not isinstance(parsed, dict):
@@ -564,11 +571,26 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
             result = json.loads(saved["result_json"])
             connection.execute("COMMIT")
             return result
-        if saved and saved["status"] in {"canceled", "failed"}:
+        if saved and saved["status"] == "canceled":
             connection.execute("COMMIT")
             raise HTTPException(
                 status_code=409,
                 detail=f"Task cannot be continued from state {saved['status']}",
+            )
+        if saved and saved["status"] == "failed":
+            payment_attempt = connection.execute(
+                "SELECT 1 FROM invoice_actions WHERE task_id = ? AND action = 'pay' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if payment_attempt:
+                connection.execute("COMMIT")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Task failed after a payment attempt and cannot be retried",
+                )
+            connection.execute(
+                "UPDATE tasks SET status = 'working', result_json = NULL, updated_at = ? WHERE task_id = ?",
+                (now, task_id),
             )
         if saved and saved["status"] == "working":
             connection.execute("COMMIT")

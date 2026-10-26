@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import os
 from pathlib import Path
 
@@ -224,6 +225,94 @@ def test_task_retry_returns_saved_decision_and_rejects_changed_package() -> None
     )
     assert first.json() == retry.json()
     assert changed.status_code == 409
+
+
+def test_identical_failed_task_retries_when_no_payment_was_attempted() -> None:
+    package = {
+        "invoice": {"invoice_id": "INV-RETRY", "amount": 30, "currency": "USD"},
+        "text": "Invoice INV-RETRY total USD 30.00",
+    }
+    now = agent.utc_now()
+    with agent.database() as connection:
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                task_id, request_hash, status, created_at, updated_at
+            ) VALUES (?, ?, 'failed', ?, ?)
+            """,
+            ("retry-analysis", agent.request_hash(package), now, now),
+        )
+
+    retried = client.post(
+        "/process",
+        json={"task_id": "retry-analysis", "package": package},
+    )
+    assert retried.status_code == 200
+    assert client.get("/tasks/retry-analysis").json()["status"]["state"] == "completed"
+
+
+def test_failed_task_with_payment_attempt_cannot_be_retried() -> None:
+    package = {
+        "invoice": {"invoice_id": "INV-FAILED-PAYMENT", "amount": 30, "currency": "USD"},
+        "text": "Invoice INV-FAILED-PAYMENT total USD 30.00",
+    }
+    now = agent.utc_now()
+    with agent.database() as connection:
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                task_id, request_hash, status, created_at, updated_at
+            ) VALUES (?, ?, 'failed', ?, ?)
+            """,
+            ("retry-payment", agent.request_hash(package), now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO invoice_actions(
+                invoice_id, action, status, task_id, created_at, updated_at
+            ) VALUES (?, 'pay', 'failed', ?, ?, ?)
+            """,
+            ("INV-FAILED-PAYMENT", "retry-payment", now, now),
+        )
+
+    retried = client.post(
+        "/process",
+        json={"task_id": "retry-payment", "package": package},
+    )
+    assert retried.status_code == 409
+    assert "payment attempt" in retried.json()["detail"]
+
+
+def test_ai_payload_too_large_uses_conservative_local_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TooLargeClient:
+        def __init__(self, timeout: int):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url: str, headers: dict, json: dict) -> httpx.Response:
+            return httpx.Response(
+                413,
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(agent, "AI_API_KEY", "test-key")
+    monkeypatch.setattr(agent.httpx, "AsyncClient", TooLargeClient)
+    result = asyncio.run(
+        agent.analyze_invoice(
+            {"invoice": {"invoice_id": "INV-LARGE", "amount": 80, "currency": "USD"}},
+            "Invoice INV-LARGE total USD 80.00",
+        )
+    )
+    assert result["invoice_id"] == "INV-LARGE"
+    assert result["action"] == "hold"
+    assert result["amount"] == 80
 
 
 def test_a2a_send_and_get_task() -> None:

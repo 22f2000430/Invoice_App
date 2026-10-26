@@ -14,6 +14,8 @@ The Agent Card is at `/.well-known/agent-card.json`. Render starts the app with 
 
 Rejected `POST /message:send` requests are logged in the Render service logs with the status, rejection reason, content type, A2A version, and whether an Authorization header was present. Request bodies and Authorization values are not logged.
 
+If the AI provider rejects an oversized invoice prompt with HTTP 413, the agent falls back to conservative local extraction and does not authorize payment. Failed tasks without a recorded payment attempt can be retried with the same task ID and identical package; tasks with a payment attempt remain blocked to prevent duplicate payment.
+
 ## Routes and protocol
 
 - `GET /health` — health check.
