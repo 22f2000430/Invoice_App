@@ -594,10 +594,10 @@ def validate_a2a_headers(content_type: str | None, version: str | None) -> None:
             status_code=415,
             detail=f"Content-Type must be {A2A_MEDIA_TYPE}",
         )
-    if version != A2A_PROTOCOL_VERSION:
+    if version is not None and version != A2A_PROTOCOL_VERSION:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported or missing A2A-Version; expected {A2A_PROTOCOL_VERSION}",
+            detail=f"Unsupported A2A-Version; expected {A2A_PROTOCOL_VERSION}",
         )
 
 

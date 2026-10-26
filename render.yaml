@@ -12,8 +12,6 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /var/data/invoice-agent.sqlite3
-      - key: A2A_API_TOKEN
-        sync: false
       - key: AI_API_KEY
         sync: false
       - key: AI_BASE_URL

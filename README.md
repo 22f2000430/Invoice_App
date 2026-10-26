@@ -5,7 +5,7 @@ An A2A-compatible FastAPI service for evidence-based invoice decisions, explicit
 ## Deploy to Render
 
 1. Push the repository to GitHub and create a Render Blueprint from `render.yaml`. It configures Uvicorn and a persistent disk mounted at `/var/data`.
-2. The A2A endpoints are public because the assignment validator does not provide an A2A bearer token. `A2A_API_TOKEN` is not used. This is separate from `AI_API_KEY`, which is used for Groq invoice analysis.
+2. The A2A endpoints are public and do not use an A2A bearer token. This is separate from `AI_API_KEY`, which is used for Groq invoice analysis.
 3. Set `AI_API_KEY` to your GroqCloud API key. The default provider settings are `AI_BASE_URL=https://api.groq.com/openai/v1` and `AI_MODEL=openai/gpt-oss-20b`.
 4. To execute payments, configure `PAYMENT_API_URL` and `PAYMENT_API_KEY` for your payment adapter. Without a payment adapter, the agent does not claim to have paid an invoice.
 5. Use the Render service's HTTPS origin as the submitted A2A base URL, for example `https://your-service.onrender.com`—do not append `/message:send`.
@@ -17,12 +17,12 @@ The Agent Card is at `/.well-known/agent-card.json`. Render starts the app with 
 - `GET /health` — health check.
 - `GET /.well-known/agent-card.json` — Agent Card; public.
 - `GET /tasks` and `GET /tasks/{task_id}` — public task access.
-- `POST /message:send` — public A2A send; requires `Content-Type: application/a2a+json` and `A2A-Version: 0.3.0`.
+- `POST /message:send` — public A2A send; requires `Content-Type: application/a2a+json`. `A2A-Version` may be omitted; if present, it must be `0.3.0`.
 - `POST /tasks/{task_id}:cancel` — public cancellation.
 - `POST /` — public JSON-RPC A2A methods.
 - `POST /process` — direct JSON API, not an A2A endpoint.
 
-A2A responses use `Content-Type: application/a2a+json`. An unsupported A2A version returns HTTP 400; a wrong request media type returns HTTP 415.
+A2A responses use `Content-Type: application/a2a+json`. An unsupported explicit A2A version returns HTTP 400; a wrong request media type returns HTTP 415.
 
 ## Local development and complete curl checks
 
