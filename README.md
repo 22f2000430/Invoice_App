@@ -12,6 +12,8 @@ An A2A-compatible FastAPI service for evidence-based invoice decisions, explicit
 
 The Agent Card is at `/.well-known/agent-card.json`. Render starts the app with `uvicorn app.main:app --host 0.0.0.0 --port $PORT`; do not use `--reload` in production.
 
+Rejected `POST /message:send` requests are logged in the Render service logs with the status, rejection reason, content type, A2A version, and whether an Authorization header was present. Request bodies and Authorization values are not logged.
+
 ## Routes and protocol
 
 - `GET /health` — health check.
@@ -107,3 +109,10 @@ Set `BASE_URL` to the Render HTTPS origin (no path suffix), then run the A2A cur
 ## Invoice safety behavior
 
 An approval must explicitly match the invoice ID and currency, and its amount cap must cover the payment amount. The AI cannot grant approval. A2A task state and receipt records are stored in SQLite on Render's persistent disk. Payment idempotency is invoice-scoped; the payment adapter should also honor the supplied idempotency key to protect against network failures during payment processing.
+
+curl -i -X POST http://localhost:8000/message:send \
+  -H 'Content-Type: application/a2a+json' \
+  -H 'A2A-Version: v3' \
+  -H 'Authorization: Bearer local-test-token' \
+  -H 'Accept: application/a2a+json' \
+  -d '{"taskId":"local-a2a-v3","package":{}}'

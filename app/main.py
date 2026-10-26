@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -13,10 +14,13 @@ from typing import Any, AsyncIterator, Iterator
 
 import httpx
 from docx import Document
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 APP_NAME = "Public Invoice Agent"
 A2A_MEDIA_TYPE = "application/a2a+json"
@@ -30,6 +34,7 @@ PAYMENT_API_URL = os.getenv("PAYMENT_API_URL")
 PAYMENT_API_KEY = os.getenv("PAYMENT_API_KEY")
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_TEXT_CHARS = 120_000
+logger = logging.getLogger("invoice_agent.a2a")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -38,6 +43,51 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan)
+
+
+def log_a2a_rejection(
+    request: Request,
+    status_code: int,
+    reason: Any,
+) -> None:
+    if request.url.path != "/message:send":
+        return
+    logger.warning(
+        "A2A request rejected: path=%s status=%d reason=%s content_type=%r "
+        "a2a_version=%r authorization_present=%s",
+        request.url.path,
+        status_code,
+        reason,
+        request.headers.get("content-type"),
+        request.headers.get("a2a-version"),
+        "authorization" in request.headers,
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def log_http_exception(
+    request: Request,
+    exc: StarletteHTTPException,
+) -> Response:
+    log_a2a_rejection(request, exc.status_code, exc.detail)
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def log_request_validation_error(
+    request: Request,
+    exc: RequestValidationError,
+) -> Response:
+    safe_errors = [
+        {
+            "location": error.get("loc"),
+            "message": error.get("msg"),
+            "type": error.get("type"),
+        }
+        for error in exc.errors()
+    ]
+    log_a2a_rejection(request, 422, safe_errors)
+    return await request_validation_exception_handler(request, exc)
 
 
 class ProcessRequest(BaseModel):
@@ -855,6 +905,7 @@ def cancel_task_endpoint(
 @app.post("/message:send", response_model=None)
 async def a2a_message_send(
     request: dict[str, Any],
+    http_request: Request,
     authorization: str | None = Header(default=None),
     content_type: str | None = Header(default=None),
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
@@ -862,6 +913,7 @@ async def a2a_message_send(
     try:
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
+        log_a2a_rejection(http_request, exc.status_code, exc.detail)
         return JSONResponse(
             {"error": exc.detail},
             status_code=exc.status_code,
@@ -871,11 +923,13 @@ async def a2a_message_send(
     if "jsonrpc" in request:
         return await a2a_rpc(
             request,
+            http_request=http_request,
             content_type=content_type,
             a2a_version=a2a_version,
         )
     params = request.get("params", request)
     if not isinstance(params, dict):
+        log_a2a_rejection(http_request, 400, "params must be an object")
         return JSONResponse(
             {"error": "params must be an object"},
             status_code=400,
@@ -884,6 +938,7 @@ async def a2a_message_send(
     try:
         task = await send_message(params)
     except HTTPException as exc:
+        log_a2a_rejection(http_request, exc.status_code, exc.detail)
         return JSONResponse(
             {"error": exc.detail},
             status_code=exc.status_code,
@@ -895,6 +950,7 @@ async def a2a_message_send(
 @app.post("/")
 async def a2a_rpc(
     request: dict[str, Any],
+    http_request: Request,
     authorization: str | None = Header(default=None),
     content_type: str | None = Header(default=None),
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
@@ -902,6 +958,7 @@ async def a2a_rpc(
     try:
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
+        log_a2a_rejection(http_request, exc.status_code, exc.detail)
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
@@ -916,6 +973,7 @@ async def a2a_rpc(
     method = request.get("method")
     params = request.get("params") or {}
     if not isinstance(params, dict):
+        log_a2a_rejection(http_request, 400, "params must be an object")
         return JSONResponse(
             {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "params must be an object"}},
             media_type=A2A_MEDIA_TYPE,
@@ -924,6 +982,7 @@ async def a2a_rpc(
         try:
             task = await send_message(params)
         except HTTPException as exc:
+            log_a2a_rejection(http_request, exc.status_code, exc.detail)
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": exc.detail}},
                 status_code=exc.status_code,
@@ -995,6 +1054,7 @@ async def a2a_rpc(
         try:
             task = cancel_task(str(task_id or ""))
         except HTTPException as exc:
+            log_a2a_rejection(http_request, exc.status_code, exc.detail)
             return JSONResponse(
                 {
                     "jsonrpc": "2.0",

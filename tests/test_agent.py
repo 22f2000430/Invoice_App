@@ -46,7 +46,9 @@ def test_agent_card_and_health() -> None:
     assert "securitySchemes" not in card
 
 
-def test_a2a_routes_are_public_and_validate_protocol_headers() -> None:
+def test_a2a_routes_are_public_and_validate_protocol_headers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     assert client.get("/tasks").status_code == 200
     assert client.post(
         "/message:send",
@@ -74,7 +76,11 @@ def test_a2a_routes_are_public_and_validate_protocol_headers() -> None:
     wrong_version = client.post(
         "/message:send",
         json=body,
-        headers={**A2A_HEADERS, "A2A-Version": "9.9.9"},
+        headers={
+            **A2A_HEADERS,
+            "A2A-Version": "9.9.9",
+            "Authorization": "Bearer do-not-log-this-token",
+        },
     )
     wrong_media = client.post(
         "/message:send",
@@ -85,6 +91,10 @@ def test_a2a_routes_are_public_and_validate_protocol_headers() -> None:
     assert wrong_media.status_code == 415
     assert wrong_version.headers["content-type"] == "application/a2a+json"
     assert wrong_media.headers["content-type"] == "application/a2a+json"
+    assert "Unsupported A2A-Version" in caplog.text
+    assert "a2a_version='9.9.9'" in caplog.text
+    assert "authorization_present=True" in caplog.text
+    assert "do-not-log-this-token" not in caplog.text
 
     assert client.get("/tasks").status_code == 200
     assert client.get("/tasks?limit=11").status_code == 422
