@@ -19,12 +19,12 @@ Rejected `POST /message:send` requests are logged in the Render service logs wit
 - `GET /health` — health check.
 - `GET /.well-known/agent-card.json` — Agent Card; public.
 - `GET /tasks` and `GET /tasks/{task_id}` — public task access.
-- `POST /message:send` — public A2A send; requires `Content-Type: application/a2a+json`. `A2A-Version` may be omitted or set to `0.3.0` or `v3`.
+- `POST /message:send` — public A2A send; accepts `Content-Type: application/json` or `application/a2a+json`. `A2A-Version` may be omitted or set to `1.0`, `1.0.0`, `0.3.0`, or `v3`.
 - `POST /tasks/{task_id}:cancel` — public cancellation.
 - `POST /` — public JSON-RPC A2A methods.
 - `POST /process` — direct JSON API, not an A2A endpoint.
 
-A2A responses use `Content-Type: application/a2a+json`. An unsupported explicit A2A version returns HTTP 400; a wrong request media type returns HTTP 415. The `v3` header value is accepted as the validator's alias for this protocol version.
+A2A responses use the matching JSON content type: requests using `application/json` receive `application/json`, and requests using `application/a2a+json` receive `application/a2a+json`. An unsupported explicit A2A version returns HTTP 400; a wrong request media type returns HTTP 415.
 
 ## Local development and complete curl checks
 
@@ -48,7 +48,7 @@ curl -i "$BASE_URL/.well-known/agent-card.json"
 # Protocol rejection checks: wrong media type -> HTTP 415; wrong version -> HTTP 400.
 curl -sS -o /dev/null -w 'wrong media type: HTTP %{http_code}\n' \
   -X POST "$BASE_URL/message:send" \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: text/plain' \
   -H 'A2A-Version: 0.3.0' \
   -d '{}'
 curl -sS -o /dev/null -w 'wrong version: HTTP %{http_code}\n' \
@@ -70,14 +70,25 @@ curl -i -X POST "$BASE_URL/message:send" \
     }
   }'
 
-# Validator compatibility: the assignment sends A2A-Version: v3 and may include
-# a Bearer token. The endpoint accepts both; expect HTTP 200.
+# Validator compatibility: the Render logs showed application/json and
+# A2A-Version: 1.0. The endpoint accepts both and returns application/json.
 curl -i -X POST "$BASE_URL/message:send" \
-  -H 'Content-Type: application/a2a+json' \
-  -H 'A2A-Version: v3' \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
   -H 'Authorization: Bearer local-test-token' \
-  -H 'Accept: application/a2a+json' \
-  -d '{"taskId":"local-a2a-v3","package":{}}'
+  -H 'Accept: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "local-a2a-v1",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "messageId": "local-a2a-v1",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "Please review invoice INV-105."}]
+      }
+    }
+  }'
 
 # List tasks (expect HTTP 200).
 curl -i "$BASE_URL/tasks" 

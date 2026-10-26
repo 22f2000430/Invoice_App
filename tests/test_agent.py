@@ -40,7 +40,7 @@ def test_agent_card_and_health() -> None:
     assert client.get("/health").json() == {"status": "ok"}
     card = client.get("/.well-known/agent-card.json").json()
     assert card["skills"][0]["id"] == "invoice-decision"
-    assert card["protocolVersion"] == "0.3.0"
+    assert card["protocolVersion"] == "1.0.0"
     assert "application/a2a+json" in card["defaultInputModes"]
     assert "security" not in card
     assert "securitySchemes" not in card
@@ -72,6 +72,30 @@ def test_a2a_routes_are_public_and_validate_protocol_headers(
     assert version_v3.status_code == 200
     assert version_v3.json()["id"] == "public-version-v3"
 
+    version_1 = client.post(
+        "/message:send",
+        json={
+            "jsonrpc": "2.0",
+            "id": "public-version-1",
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "messageId": "public-version-1",
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "Please review this invoice."}],
+                }
+            },
+        },
+        headers={
+            "Content-Type": "application/json",
+            "A2A-Version": "1.0",
+            "Authorization": "Bearer validator-token",
+        },
+    )
+    assert version_1.status_code == 200
+    assert version_1.headers["content-type"] == "application/json"
+    assert version_1.json()["result"]["id"] == "public-version-1"
+
     body = {"taskId": "protocol-check", "package": {}}
     wrong_version = client.post(
         "/message:send",
@@ -85,7 +109,7 @@ def test_a2a_routes_are_public_and_validate_protocol_headers(
     wrong_media = client.post(
         "/message:send",
         json=body,
-        headers={**A2A_HEADERS, "Content-Type": "application/json"},
+        headers={**A2A_HEADERS, "Content-Type": "application/json-patch+json"},
     )
     assert wrong_version.status_code == 400
     assert wrong_media.status_code == 415

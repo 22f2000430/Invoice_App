@@ -25,7 +25,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 APP_NAME = "Public Invoice Agent"
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_PROTOCOL_VERSION = "0.3.0"
-A2A_PROTOCOL_VERSION_ALIASES = {A2A_PROTOCOL_VERSION, "v3"}
+A2A_JSON_MEDIA_TYPE = "application/json"
+A2A_PROTOCOL_VERSION_ALIASES = {A2A_PROTOCOL_VERSION, "1.0", "1.0.0", "v3"}
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/invoice-agent.sqlite3")
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
@@ -640,16 +641,21 @@ async def process_package(task_id: str, package: dict[str, Any]) -> dict[str, An
 
 def validate_a2a_headers(content_type: str | None, version: str | None) -> None:
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
-    if media_type != A2A_MEDIA_TYPE:
+    if media_type not in {A2A_MEDIA_TYPE, A2A_JSON_MEDIA_TYPE}:
         raise HTTPException(
             status_code=415,
-            detail=f"Content-Type must be {A2A_MEDIA_TYPE}",
+            detail=f"Content-Type must be {A2A_MEDIA_TYPE} or {A2A_JSON_MEDIA_TYPE}",
         )
     if version is not None and version not in A2A_PROTOCOL_VERSION_ALIASES:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported A2A-Version; expected one of {', '.join(sorted(A2A_PROTOCOL_VERSION_ALIASES))}",
         )
+
+
+def a2a_response_media_type(content_type: str | None) -> str:
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+    return A2A_JSON_MEDIA_TYPE if media_type == A2A_JSON_MEDIA_TYPE else A2A_MEDIA_TYPE
 
 
 def cancel_task(task_id: str) -> dict[str, Any]:
@@ -724,7 +730,7 @@ def agent_card() -> dict[str, Any]:
         "name": APP_NAME,
         "description": "Analyzes invoice packages, cites evidence, enforces explicit approval, and records idempotent payment receipts.",
         "url": base_url,
-        "protocolVersion": A2A_PROTOCOL_VERSION,
+        "protocolVersion": "1.0.0",
         "version": "1.0.0",
         "preferredTransport": "JSONRPC",
         "capabilities": {"streaming": False, "pushNotifications": False},
@@ -910,6 +916,7 @@ async def a2a_message_send(
     content_type: str | None = Header(default=None),
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
 ) -> JSONResponse:
+    response_media_type = a2a_response_media_type(content_type)
     try:
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
@@ -918,7 +925,7 @@ async def a2a_message_send(
             {"error": exc.detail},
             status_code=exc.status_code,
             headers=exc.headers,
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     if "jsonrpc" in request:
         return await a2a_rpc(
@@ -933,7 +940,7 @@ async def a2a_message_send(
         return JSONResponse(
             {"error": "params must be an object"},
             status_code=400,
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     try:
         task = await send_message(params)
@@ -942,9 +949,9 @@ async def a2a_message_send(
         return JSONResponse(
             {"error": exc.detail},
             status_code=exc.status_code,
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
-    return JSONResponse(task, media_type=A2A_MEDIA_TYPE)
+    return JSONResponse(task, media_type=response_media_type)
 
 
 @app.post("/")
@@ -955,6 +962,7 @@ async def a2a_rpc(
     content_type: str | None = Header(default=None),
     a2a_version: str | None = Header(default=None, alias="A2A-Version"),
 ) -> JSONResponse:
+    response_media_type = a2a_response_media_type(content_type)
     try:
         validate_a2a_headers(content_type, a2a_version)
     except HTTPException as exc:
@@ -967,7 +975,7 @@ async def a2a_rpc(
             },
             status_code=exc.status_code,
             headers=exc.headers,
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     request_id = request.get("id")
     method = request.get("method")
@@ -976,7 +984,7 @@ async def a2a_rpc(
         log_a2a_rejection(http_request, 400, "params must be an object")
         return JSONResponse(
             {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "params must be an object"}},
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     if method in {"message/send", "tasks/send"}:
         try:
@@ -986,11 +994,11 @@ async def a2a_rpc(
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": exc.detail}},
                 status_code=exc.status_code,
-                media_type=A2A_MEDIA_TYPE,
+                media_type=response_media_type,
             )
         return JSONResponse(
             {"jsonrpc": "2.0", "id": request_id, "result": task},
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     if method == "tasks/list":
         with database() as connection:
@@ -1013,7 +1021,7 @@ async def a2a_rpc(
                     ]
                 },
             },
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     if method in {"tasks/get", "tasks/getTask"}:
         task_id = params.get("id") or params.get("taskId")
@@ -1025,7 +1033,7 @@ async def a2a_rpc(
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "Task not found"}},
                 status_code=404,
-                media_type=A2A_MEDIA_TYPE,
+                media_type=response_media_type,
             )
         task_result = json.loads(row["result_json"]) if row["result_json"] else None
         return JSONResponse(
@@ -1047,7 +1055,7 @@ async def a2a_rpc(
                     ),
                 },
             },
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     if method in {"tasks/cancel", "tasks/cancelTask"}:
         task_id = params.get("id") or params.get("taskId")
@@ -1062,14 +1070,14 @@ async def a2a_rpc(
                     "error": {"code": -32000, "message": exc.detail},
                 },
                 status_code=exc.status_code,
-                media_type=A2A_MEDIA_TYPE,
+                media_type=response_media_type,
             )
         return JSONResponse(
             {"jsonrpc": "2.0", "id": request_id, "result": task},
-            media_type=A2A_MEDIA_TYPE,
+            media_type=response_media_type,
         )
     return JSONResponse(
         {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}},
         status_code=404,
-        media_type=A2A_MEDIA_TYPE,
+        media_type=response_media_type,
     )
